@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+use reqwest::header::RANGE;
+use tokio::io::AsyncSeekExt;
 use tokio::{fs::File, io::AsyncWriteExt, sync::watch};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,10 +55,30 @@ async fn download_with_control(
     mut rx: watch::Receiver<TaskState>, // 使用 watch::Receiver 监听状态
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    let mut response = client.get(url).send().await?;
 
-    if response.status().is_success() {
-        let mut file = File::create(output_file).await?;
+    // 检查本地文件是否存在以及已下载的大小
+    let local_file_size = match tokio::fs::metadata(output_file).await {
+        Ok(metadata) => metadata.len(),
+        Err(_) => 0,
+    };
+
+    // 设置 Range 请求头以支持断点续传
+    let mut request = client.get(url);
+    if local_file_size > 0 {
+        request = request.header(RANGE, format!("bytes={}-", local_file_size));
+    }
+
+    let mut response = request.send().await?;
+    if response.status().is_success() || response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        let mut file = if local_file_size > 0 {
+            // 如果文件已存在，打开文件并移动到末尾
+            let mut f = File::options().append(true).open(output_file).await?;
+            f.seek(tokio::io::SeekFrom::End(0)).await?;
+            f
+        } else {
+            // 如果文件不存在，创建新文件
+            File::create(output_file).await?
+        };
 
         while let Some(chunk) = response.chunk().await? {
             // 检查任务状态
