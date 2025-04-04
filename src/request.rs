@@ -1,12 +1,5 @@
 #![allow(dead_code)]
-use {
-    std::sync::Arc,
-    tokio::{
-        fs::File,
-        io::AsyncWriteExt,
-        sync::{watch, Mutex},
-    },
-};
+use tokio::{fs::File, io::AsyncWriteExt, sync::watch};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TaskState {
@@ -15,15 +8,13 @@ pub enum TaskState {
 }
 
 pub struct Downloader {
-    state: Arc<Mutex<TaskState>>,
-    notifier: watch::Sender<TaskState>,
+    notifier: watch::Sender<TaskState>, // 直接使用 watch::Sender 存储状态
 }
 
 impl Downloader {
     /// 创建一个新的 Downloader 实例
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(TaskState::Paused).into(),
             notifier: watch::Sender::new(TaskState::Paused),
         }
     }
@@ -34,36 +25,32 @@ impl Downloader {
         url: &str,
         output_file: &str,
     ) -> tokio::task::JoinHandle<()> {
-        let state = self.state.clone();
-        let rx = self.notifier.subscribe();
+        let rx = self.notifier.subscribe(); // 订阅状态变化
         let url = url.to_string();
         let output_file = output_file.to_string();
 
         tokio::spawn(async move {
-            if let Err(e) = download_with_control(&url, &output_file, state, rx).await {
+            if let Err(e) = download_with_control(&url, &output_file, rx).await {
                 eprintln!("下载任务出错: {:?}", e);
             }
         })
     }
 
     /// 设置任务状态为运行
-    pub async fn start(&self) {
-        *self.state.lock().await = TaskState::Running;
-        let _ = self.notifier.send(TaskState::Running);
+    pub fn start(&self) {
+        let _ = self.notifier.send(TaskState::Running); // 更新状态为 Running
     }
 
     /// 设置任务状态为暂停
-    pub async fn pause(&self) {
-        *self.state.lock().await = TaskState::Paused;
-        let _ = self.notifier.send(TaskState::Paused);
+    pub fn pause(&self) {
+        let _ = self.notifier.send(TaskState::Paused); // 更新状态为 Paused
     }
 }
 
 async fn download_with_control(
     url: &str,
     output_file: &str,
-    state: Arc<Mutex<TaskState>>,
-    mut notifier: watch::Receiver<TaskState>,
+    mut rx: watch::Receiver<TaskState>, // 使用 watch::Receiver 监听状态
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     let mut response = client.get(url).send().await?;
@@ -73,8 +60,8 @@ async fn download_with_control(
 
         while let Some(chunk) = response.chunk().await? {
             // 检查任务状态
-            if let TaskState::Paused = state.lock().await.clone() {
-                notifier.changed().await.unwrap(); // 等待状态变化
+            if *rx.borrow() == TaskState::Paused {
+                rx.changed().await.unwrap(); // 等待状态变化
             }
 
             // 写入文件

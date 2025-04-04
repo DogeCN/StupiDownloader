@@ -16,8 +16,8 @@ async fn main() {
     println!("输入命令: (start/pause/exit)");
     while let Ok(Some(line)) = reader.next_line().await {
         match line.trim() {
-            "start" => downloader.start().await,
-            "pause" => downloader.pause().await,
+            "start" => downloader.start(),
+            "pause" => downloader.pause(),
             "exit" => {
                 println!("退出程序...");
                 break;
