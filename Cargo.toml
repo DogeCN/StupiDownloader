@@ -1,0 +1,18 @@
+[package]
+name = "gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+egui = "0.31"
+eframe = "0.31"
+reqwest = "0.12"
+
+[dependencies.tokio]
+version = "1"
+features = ["full"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
