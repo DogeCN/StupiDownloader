@@ -1380,7 +1380,9 @@ dependencies = [
  "eframe",
  "egui",
  "futures-util",
+ "percent-encoding",
  "reqwest",
+ "thiserror 2.0.12",
  "tokio",
 ]
 
