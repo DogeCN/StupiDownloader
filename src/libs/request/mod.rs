@@ -29,25 +29,22 @@ pub enum DownloadError {
 pub async fn download(url: &str) -> Result<(), DownloadError> {
     let client = Client::new();
     let response = client.head(url).send().await?;
-    let output_path = filename_from(&response);
-    let total_size = get_total_size(response).await?;
-    let num_chunks = calculate_optimal_chunks(total_size);
-    let chunks = calculate_chunk_ranges(total_size, num_chunks);
-    let temp_files: Vec<_> = (0..num_chunks)
-        .map(|i| PathBuf::from(format!("{}.part{}", output_path, i)))
+    let output = filename_from(&response);
+    let total_size = get_total_size(&response)?;
+    let chunk_num = calculate_optimal_chunks(total_size);
+    let chunks = calculate_chunk_ranges(total_size, chunk_num);
+    let temps: Vec<_> = (0..chunk_num)
+        .map(|i| PathBuf::from(format!("{}.part{}", output, i)))
         .collect();
 
     // 并行下载
-    let tasks = chunks
-        .into_iter()
-        .zip(&temp_files)
-        .map(|((start, end), path)| {
-            let client = client.clone();
-            let url = url.to_owned();
-            let path = path.clone();
+    let tasks = chunks.into_iter().zip(&temps).map(|((start, end), path)| {
+        let client = client.clone();
+        let url = url.to_owned();
+        let path = path.clone();
 
-            tokio::spawn(async move { download_chunk(&client, &url, &path, start, end).await })
-        });
+        tokio::spawn(async move { download_chunk(&client, &url, &path, start, end).await })
+    });
 
     // 收集结果
     let results = future::join_all(tasks).await;
@@ -65,8 +62,8 @@ pub async fn download(url: &str) -> Result<(), DownloadError> {
         return Err(DownloadError::ChunkFailure(errors.join("\n")));
     }
 
-    merge_chunks(&output_path, &temp_files).await?;
-    cleanup(&temp_files).await?;
+    merge_chunks(&output, &temps).await?;
+    cleanup(&temps).await?;
     Ok(())
 }
 
@@ -102,16 +99,17 @@ async fn download_chunk(
 }
 
 /// 智能分块计算
-fn calculate_optimal_chunks(total_size: u64) -> u8 {
+fn calculate_optimal_chunks(total_size: u64) -> usize {
     match total_size {
-        0..1_048_576 => 2,             // <1MB
-        1_048_576..10_485_760 => 4,    // <10MB
-        10_485_760..=104_857_600 => 8, // <100MB
-        _ => 16,                       // >100MB
+        0..1_048_576 => 1,                // <1MB
+        1_048_576..10_485_760 => 2,       // <10MB
+        10_485_760..104_857_600 => 4,     // <100MB
+        104_857_600..=1_073_741_824 => 8, // <1GB
+        _ => 16,                          // >1GB
     }
 }
 
-async fn get_total_size(resp: Response) -> Result<u64, DownloadError> {
+fn get_total_size(resp: &Response) -> Result<u64, DownloadError> {
     // 检查Range支持
     match resp.headers().get("Accept-Ranges").map(|v| v.as_bytes()) {
         Some(b"bytes") => Ok(resp
@@ -124,7 +122,7 @@ async fn get_total_size(resp: Response) -> Result<u64, DownloadError> {
     }
 }
 
-fn calculate_chunk_ranges(total_size: u64, num_chunks: u8) -> Vec<(u64, u64)> {
+fn calculate_chunk_ranges(total_size: u64, num_chunks: usize) -> Vec<(u64, u64)> {
     let chunk_size = total_size / num_chunks as u64;
     (0..num_chunks)
         .map(|i| {
@@ -139,10 +137,10 @@ fn calculate_chunk_ranges(total_size: u64, num_chunks: u8) -> Vec<(u64, u64)> {
         .collect()
 }
 
-async fn merge_chunks(output_path: &str, temp_files: &[PathBuf]) -> Result<(), DownloadError> {
-    let mut output = File::create(output_path).await?;
+async fn merge_chunks(output: &str, temps: &[PathBuf]) -> Result<(), DownloadError> {
+    let mut output = File::create(output).await?;
 
-    for path in temp_files {
+    for path in temps {
         let mut chunk = File::open(path).await?;
         tokio::io::copy(&mut chunk, &mut output).await?;
     }
@@ -150,8 +148,8 @@ async fn merge_chunks(output_path: &str, temp_files: &[PathBuf]) -> Result<(), D
     Ok(())
 }
 
-async fn cleanup(temp_files: &[PathBuf]) -> Result<(), DownloadError> {
-    for path in temp_files {
+async fn cleanup(temps: &[PathBuf]) -> Result<(), DownloadError> {
+    for path in temps {
         if path.exists() {
             remove_file(path).await?;
         }
