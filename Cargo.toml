@@ -7,7 +7,6 @@ edition = "2021"
 egui = "0.31"
 eframe = "0.31"
 futures-util = "0.3"
-num_cpus = "1"
 percent-encoding = "2"
 thiserror = "2"
 
