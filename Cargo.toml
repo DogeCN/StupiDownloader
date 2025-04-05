@@ -6,7 +6,11 @@ edition = "2021"
 [dependencies]
 egui = "0.31"
 eframe = "0.31"
-reqwest = "0.12"
+futures-util = "0.3"
+
+[dependencies.reqwest]
+version = "0.12"
+features = ["stream"]
 
 [dependencies.tokio]
 version = "1"

@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use futures_util::StreamExt;
 use reqwest::header::RANGE;
 use tokio::io::AsyncSeekExt;
 use tokio::{fs::File, io::AsyncWriteExt, sync::watch};
@@ -30,9 +29,9 @@ impl Downloader {
         url: &str,
         output_file: &str,
     ) -> tokio::task::JoinHandle<()> {
-        let url = url.to_owned();
-        let output_file = output_file.to_owned();
-        let notifier = self.notifier.clone();
+        let notifier = self.notifier.subscribe();
+        let url = url.to_string();
+        let output_file = output_file.to_string();
 
         tokio::spawn(async move {
             if let Err(e) = download_with_control(&url, &output_file, notifier).await {
@@ -60,7 +59,7 @@ impl Downloader {
 async fn download_with_control(
     url: &str,
     output_file: &str,
-    mut notifier: watch::Sender<TaskState>,
+    notifier: watch::Sender<TaskState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
 
@@ -111,12 +110,10 @@ async fn download_with_control(
 
         let mut downloaded_bytes = local_file_size;
 
-        let mut stream = response.bytes_stream();
-
-        while let Some(Ok(chunk)) = stream.next().await {
+        while let Some(chunk) = response.chunk().await? {
             // 检查任务状态
             while let TaskState::Paused = *notifier.borrow() {
-                notifier.changed().await?;
+                notifier.subscribe().changed().await?;
             }
 
             // 写入文件
