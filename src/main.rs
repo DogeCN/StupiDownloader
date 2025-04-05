@@ -7,7 +7,7 @@ async fn main() {
     )
     .await
     {
-        eprintln!("下载失败: {:?}", e);
+        eprintln!("下载失败: {:}", e);
     } else {
         println!("下载成功");
     }

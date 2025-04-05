@@ -1,13 +1,20 @@
+mod consts;
 mod filename;
 use {
+    consts::*,
     filename::filename_from,
-    futures_util::{future, StreamExt},
+    futures_util::stream::{iter, StreamExt},
     reqwest::{Client, Response},
-    std::path::{Path, PathBuf},
+    std::{
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicUsize, Ordering},
+    },
     thiserror::Error,
     tokio::{
-        fs::{remove_file, File},
-        io::AsyncWriteExt,
+        fs::{remove_file, File, OpenOptions},
+        io::{AsyncSeekExt, AsyncWriteExt, BufWriter},
+        sync::{mpsc, Semaphore},
+        task::{JoinError, JoinSet},
     },
 };
 
@@ -24,50 +31,139 @@ pub enum DownloadError {
 
     #[error("Chunk download failed: {0}")]
     ChunkFailure(String),
+
+    #[error("Merge failed: {0}")]
+    MergeFailure(String),
+
+    #[error("Task join failed: {0}")]
+    Join(#[from] JoinError),
 }
 
 pub async fn download(url: &str) -> Result<(), DownloadError> {
     let client = Client::new();
-    let response = client.head(url).send().await?;
+    let response = client.head(url).header(AGENT.0, AGENT.1).send().await?;
     let output = filename_from(&response);
     let total_size = get_total_size(&response)?;
-    let chunk_num = calculate_optimal_chunks(total_size);
-    let chunks = calculate_chunk_ranges(total_size, chunk_num);
-    let temps: Vec<_> = (0..chunk_num)
+    let total_tasks = calculate_concurrent_tasks();
+    let total_chunk = calculate_optimal_chunks(total_size);
+    let chunks = calculate_chunk_ranges(total_size, total_chunk);
+
+    // 创建临时文件列表
+    let temps: Vec<_> = (0..total_chunk)
         .map(|i| PathBuf::from(format!("{}.part{}", output, i)))
         .collect();
 
-    // 并行下载
-    let tasks = chunks.into_iter().zip(&temps).map(|((start, end), path)| {
-        let client = client.clone();
-        let url = url.to_owned();
-        let path = path.clone();
+    // 使用多级并行流水线
+    let (notifier, mut tracer) = mpsc::channel::<(usize, PathBuf)>(total_chunk);
+    let state = std::sync::Arc::new(AtomicUsize::new(0));
 
-        tokio::spawn(async move { download_chunk(&client, &url, &path, start, end).await })
+    // 生产者：并行下载分块
+    let producers = iter(chunks.into_iter().zip(&temps).enumerate())
+        .map(|(id, ((start, end), path))| {
+            let client = client.clone();
+            let url = url.to_owned();
+            let path = path.clone();
+            let notifier = notifier.clone();
+            let state = state.clone();
+            let semaphore = std::sync::Arc::new(Semaphore::new(total_tasks));
+
+            async move {
+                let _ = semaphore.acquire().await;
+                state.fetch_add(1, Ordering::Relaxed);
+
+                let result = download_chunk(&client, &url, &path, start, end).await;
+
+                if result.is_ok() {
+                    let _ = notifier.send((id, path)).await;
+                }
+                state.fetch_sub(1, Ordering::Relaxed);
+                result
+            }
+        })
+        .buffer_unordered(total_tasks);
+
+    // 消费者：并行合并分块
+    let consumer = tokio::spawn({
+        let output = output.clone();
+        async move {
+            let mut mix = JoinSet::new();
+
+            // 预创建输出文件
+            let _ = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&output)
+                .await?;
+
+            while let Some((_, path)) = tracer.recv().await {
+                let output = output.clone();
+                mix.spawn(async move {
+                    let mut out = OpenOptions::new().write(true).open(&output).await?;
+
+                    let mut chunk = File::open(&path).await?;
+                    let pos = out.stream_position().await?;
+                    out.seek(std::io::SeekFrom::Start(pos)).await?;
+
+                    tokio::io::copy(&mut chunk, &mut out).await?;
+
+                    drop(chunk);
+                    remove_file(&path).await?;
+
+                    Ok::<_, std::io::Error>(pos)
+                });
+            }
+
+            // 等待所有合并任务完成
+            let mut results = Vec::new();
+            while let Some(res) = mix.join_next().await {
+                results.push(res??);
+            }
+
+            // 检查是否所有分块都已合并
+            if results.len() != total_chunk {
+                return Err(DownloadError::MergeFailure(format!(
+                    "Missing chunks, expected {} got {}",
+                    total_chunk,
+                    results.len()
+                )));
+            }
+
+            Ok(())
+        }
     });
 
-    // 收集结果
-    let results = future::join_all(tasks).await;
-    let mut errors = Vec::new();
+    // 执行下载并收集结果
+    let results: Vec<Result<(), DownloadError>> =
+        producers.collect::<Vec<_>>().await.into_iter().collect();
 
-    for (i, result) in results.into_iter().enumerate() {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => errors.push(format!("分块 {} 失败: {}", i, e)),
-            Err(e) => errors.push(format!("分块 {} 运行时错误: {:?}", i, e)),
-        }
-    }
+    // 检查下载错误
+    let errors: Vec<String> = results
+        .into_iter()
+        .filter_map(|r| r.err().map(|e| e.to_string()))
+        .collect();
 
     if !errors.is_empty() {
         return Err(DownloadError::ChunkFailure(errors.join("\n")));
     }
 
-    merge_chunks(&output, &temps).await?;
-    cleanup(&temps).await?;
+    // 等待合并完成
+    consumer.await??;
+
     Ok(())
 }
 
-/// 分块下载实现
+/// 自适应并发控制
+fn calculate_concurrent_tasks() -> usize {
+    let num_cpus = num_cpus::get();
+    match num_cpus {
+        1..=2 => 2,
+        3..=4 => 4,
+        5..=8 => 8,
+        _ => 16.min(32), // 不超过32个并发
+    }
+}
+
+/// 优化后的分块下载实现
 async fn download_chunk(
     client: &Client,
     url: &str,
@@ -77,40 +173,50 @@ async fn download_chunk(
 ) -> Result<(), DownloadError> {
     let response = client
         .get(url)
+        .header(AGENT.0, AGENT.1)
         .header("Range", format!("bytes={}-{}", start, end))
         .send()
         .await?;
 
     if !response.status().is_success() {
         return Err(DownloadError::ChunkFailure(format!(
-            "无效状态码: {}",
+            "Invalid status code: {}",
             response.status()
         )));
     }
 
-    let mut file = File::create(path).await?;
+    let mut file = BufWriter::new(File::create(path).await?);
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
         file.write_all(&chunk?).await?;
     }
 
+    file.flush().await?;
     Ok(())
 }
 
-/// 智能分块计算
+/// 智能分块计算 (优化版)
 fn calculate_optimal_chunks(total_size: u64) -> usize {
-    match total_size {
-        0..1_048_576 => 1,                // <1MB
-        1_048_576..10_485_760 => 2,       // <10MB
-        10_485_760..104_857_600 => 4,     // <100MB
-        104_857_600..=1_073_741_824 => 8, // <1GB
-        _ => 16,                          // >1GB
-    }
+    const SIZE_TABLE: [(u64, usize); 6] = [
+        (MB, 1),        // 1MB
+        (10 * MB, 2),   // 10MB
+        (100 * MB, 4),  // 100MB
+        (GB, 8),        // 1GB
+        (10 * GB, 16),  // 10GB
+        (u64::MAX, 32), // 10+GB
+    ];
+
+    let base_chunks = SIZE_TABLE
+        .iter()
+        .find_map(|&(size, chunks)| (total_size > size).then_some(chunks))
+        .unwrap();
+
+    // 考虑CPU核心数
+    base_chunks.max(num_cpus::get()).min(64) // 不超过64个分块
 }
 
 fn get_total_size(resp: &Response) -> Result<u64, DownloadError> {
-    // 检查Range支持
     match resp.headers().get("Accept-Ranges").map(|v| v.as_bytes()) {
         Some(b"bytes") => Ok(resp
             .headers()
@@ -135,24 +241,4 @@ fn calculate_chunk_ranges(total_size: u64, num_chunks: usize) -> Vec<(u64, u64)>
             (start, end)
         })
         .collect()
-}
-
-async fn merge_chunks(output: &str, temps: &[PathBuf]) -> Result<(), DownloadError> {
-    let mut output = File::create(output).await?;
-
-    for path in temps {
-        let mut chunk = File::open(path).await?;
-        tokio::io::copy(&mut chunk, &mut output).await?;
-    }
-
-    Ok(())
-}
-
-async fn cleanup(temps: &[PathBuf]) -> Result<(), DownloadError> {
-    for path in temps {
-        if path.exists() {
-            remove_file(path).await?;
-        }
-    }
-    Ok(())
 }
