@@ -42,43 +42,44 @@ pub async fn download(url: &str) -> Result<(), DownloadError> {
     let total_chunk = fits(total_size);
     let chunk_size = total_size / total_chunk;
 
+    println!("Totol: {}, Size: {}", total_chunk, chunk_size);
+
     File::create(&output).await?.set_len(total_size).await?;
 
-    let producers = iter((0..total_chunk).map(|i| async {
-        let start = i * chunk_size;
-        let response = client
-            .get(url)
-            .header(AGENT.0, AGENT.1)
-            .header(
-                "Range",
-                format!(
-                    "bytes={}-{}",
-                    start,
-                    (i == total_chunk - 1)
-                        .then_some(total_size - 1)
-                        .unwrap_or((i + 1) * chunk_size - 1)
-                ),
-            )
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            return Err(DownloadError::ChunkFailure(format!(
-                "Invalid status code: {}",
-                response.status()
-            )));
+    let producers = iter((0..total_chunk).map(|i| {
+        let client = &client;
+        let output = &output;
+        async move {
+            let start = i * chunk_size;
+            let end = (i == total_chunk - 1)
+                .then_some(total_size)
+                .unwrap_or((i + 1) * chunk_size - 1);
+            let response = client
+                .get(url)
+                .header(AGENT.0, AGENT.1)
+                .header("Range", format!("bytes={}-{}", start, end))
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                return Err(DownloadError::ChunkFailure(format!(
+                    "Invalid status code: {}",
+                    response.status()
+                )));
+            }
+            let mut file = BufWriter::new({
+                let mut file = OpenOptions::new().write(true).open(output).await?;
+                file.seek(std::io::SeekFrom::Start(start)).await?;
+                file
+            });
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                file.write_all(&chunk?).await?;
+            }
+            file.flush().await?;
+            Ok(())
         }
-        let mut file = BufWriter::new({
-            let mut file = OpenOptions::new().write(true).open(output).await?;
-            file.seek(std::io::SeekFrom::Start(start)).await?;
-            file
-        });
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            file.write_all(&chunk?).await?;
-        }
-        Ok(())
     }))
-    .buffer_unordered(8);
+    .buffer_unordered(32);
 
     let error: String = producers
         .collect::<Vec<_>>()
