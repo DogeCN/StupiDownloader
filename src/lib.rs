@@ -1,3 +1,4 @@
 mod libs;
 
-pub use libs::download;
+pub use libs::DownloadError;
+pub use libs::Downloader;
