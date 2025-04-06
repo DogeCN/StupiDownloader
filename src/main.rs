@@ -3,7 +3,7 @@ use gui::download;
 #[tokio::main]
 async fn main() {
     if let Err(e) = download(
-        "https://zenlayer.dl.sourceforge.net/project/winmerge/stable/2.16.46/WinMerge-2.16.46-x64-Setup.exe",
+        "https://github.com/DogeCN/Plume-Lexicon/releases/download/v1.15.3/Plume-Lexicon.exe",
     )
     .await
     {
