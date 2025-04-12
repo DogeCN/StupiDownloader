@@ -1,7 +1,8 @@
 [package]
-name = "gui"
+name = "stupidownload"
+authors = ["DogeCN"]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 egui = "0.31"
@@ -17,9 +18,12 @@ features = ["stream"]
 
 [dependencies.tokio]
 version = "1.44.2"
-features = ["full"]
+features = ["rt-multi-thread"]
 
 [profile.release]
-lto = true
+lto = "fat"
+debug = 0
+panic = "abort"
+opt-level = "s"
 codegen-units = 1
 strip = true

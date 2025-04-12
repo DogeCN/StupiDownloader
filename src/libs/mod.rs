@@ -3,11 +3,11 @@ mod filename;
 use {
     consts::*,
     filename::filename_from,
-    futures_util::stream::{iter, StreamExt},
+    futures_util::stream::{StreamExt, iter},
     reqwest::Client,
     std::sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     thiserror::Error,
     tokio::{
@@ -58,7 +58,7 @@ impl Tracer {
     fn add(&self, size: u64) {
         self.counter.fetch_add(size, Ordering::Relaxed);
         self.sender
-            .send(self.counter.load(Ordering::Relaxed))
+            .send(self.counter.load(Ordering::Relaxed) * 100 / self.total_size)
             .unwrap();
     }
 }
