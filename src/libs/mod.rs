@@ -13,6 +13,7 @@ use {
     tokio::{
         fs::{File, OpenOptions},
         io::{AsyncSeekExt, AsyncWriteExt, BufWriter},
+        sync::watch::{Receiver, Sender},
         task::{JoinError, JoinHandle},
     },
 };
@@ -38,14 +39,37 @@ pub enum DownloadError {
     Join(#[from] JoinError),
 }
 
+#[derive(Clone)]
+struct Tracer {
+    pub total_size: u64,
+    counter: Arc<AtomicU64>,
+    sender: Sender<u64>,
+}
+
+impl Tracer {
+    fn new(total_size: u64) -> Self {
+        Self {
+            total_size,
+            counter: Arc::new(AtomicU64::new(0)),
+            sender: Sender::new(0),
+        }
+    }
+
+    fn add(&self, size: u64) {
+        self.counter.fetch_add(size, Ordering::Relaxed);
+        self.sender
+            .send(self.counter.load(Ordering::Relaxed))
+            .unwrap();
+    }
+}
+
 pub struct Downloader {
     handle: Option<JoinHandle<Result<(), DownloadError>>>,
     client: Client,
+    tracer: Tracer,
     pub url: String,
     pub output: String,
     pub total_chunk: u64,
-    counter: Arc<AtomicU64>,
-    pub total_size: u64,
 }
 
 impl Downloader {
@@ -73,11 +97,10 @@ impl Downloader {
         Ok(Self {
             handle: None,
             client,
+            tracer: Tracer::new(total_size),
             url: url.to_owned(),
             output: output.to_owned(),
             total_chunk,
-            counter: Arc::new(AtomicU64::new(0)),
-            total_size,
         })
     }
 
@@ -87,21 +110,16 @@ impl Downloader {
             self.url.clone(),
             self.output.clone(),
             self.total_chunk,
-            self.counter.clone(),
-            self.total_size,
+            self.tracer.clone(),
         )));
     }
 
-    pub fn progress(&self) -> u64 {
-        self.counter.load(Ordering::Relaxed) * 100 / self.total_size
+    pub fn watcher(&self) -> Receiver<u64> {
+        self.tracer.sender.subscribe()
     }
 
     pub fn running(&self) -> bool {
         self.handle.as_ref().is_some_and(|h| !h.is_finished())
-    }
-
-    pub fn cancel(&mut self) {
-        self.handle.take();
     }
 
     pub async fn join(&mut self) -> Result<(), DownloadError> {
@@ -114,16 +132,16 @@ async fn download(
     url: String,
     output: String,
     total_chunk: u64,
-    counter: Arc<AtomicU64>,
-    total_size: u64,
+    tracer: Tracer,
 ) -> Result<(), DownloadError> {
+    let total_size = tracer.total_size;
     File::create(&output).await?.set_len(total_size).await?;
 
     let producers = iter((0..total_chunk).map(|i| {
         let client = client.clone();
         let url = &url;
         let output = &output;
-        let counter = &counter;
+        let tracer = &tracer;
         async move {
             let start = i * MB;
             let end = (i == total_chunk - 1)
@@ -140,7 +158,7 @@ async fn download(
                 let mut stream = response.bytes_stream();
                 while let Some(chunk) = stream.next().await {
                     let chunk = chunk?;
-                    counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    tracer.add(chunk.len() as u64);
                     file.write_all(&chunk).await?;
                 }
                 file.flush().await?;

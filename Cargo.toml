@@ -9,13 +9,14 @@ eframe = "0.31"
 futures-util = "0.3"
 percent-encoding = "2"
 thiserror = "2"
+arboard = "3.5"
 
 [dependencies.reqwest]
 version = "0.12"
 features = ["stream"]
 
 [dependencies.tokio]
-version = "1"
+version = "1.44.2"
 features = ["full"]
 
 [profile.release]
