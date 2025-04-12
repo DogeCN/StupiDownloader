@@ -38,47 +38,20 @@ pub enum DownloadError {
     Join(#[from] JoinError),
 }
 
-#[derive(Clone)]
-pub struct Tracer {
+pub struct Downloader {
+    handle: Option<JoinHandle<Result<(), DownloadError>>>,
+    client: Client,
+    pub url: String,
+    pub output: String,
+    pub total_chunk: u64,
     counter: Arc<AtomicU64>,
     pub total_size: u64,
 }
 
-impl Tracer {
-    fn new(total_size: u64) -> Self {
-        Self {
-            counter: Arc::new(AtomicU64::new(0)),
-            total_size,
-        }
-    }
-
-    fn update(&self, item: &[u8]) {
-        self.counter
-            .fetch_add(size_of_val(item) as u64, Ordering::Relaxed);
-    }
-
-    pub fn progress(&self) -> u64 {
-        self.counter.load(Ordering::Relaxed) * 100 / self.total_size
-    }
-
-    pub fn running(&self) -> bool {
-        self.counter.load(Ordering::Relaxed) < self.total_size
-    }
-}
-
-pub struct Downloader {
-    handle: Option<JoinHandle<Result<(), DownloadError>>>,
-    pub url: String,
-    pub output: String,
-    pub chunk_size: u64,
-    pub total_chunk: u64,
-    pub tracer: Tracer,
-}
-
 impl Downloader {
     pub async fn new(url: &str) -> Result<Self, DownloadError> {
-        let client = Client::new();
-        let response = client.head(url).header(AGENT.0, AGENT.1).send().await?;
+        let client = Client::builder().user_agent(UA).build()?;
+        let response = client.head(url).send().await?;
         let output = filename_from(&response);
         let total_size = response
             .headers()
@@ -94,32 +67,41 @@ impl Downloader {
             .get("Accept-Ranges")
             .map(|v| v.as_bytes())
         {
-            Some(b"bytes") => SIZE_TABLE
-                .iter()
-                .find_map(|&(size, num)| (size > total_size).then_some(num))
-                .unwrap(),
+            Some(b"bytes") => 1.max(total_size / MB),
             _ => 1,
         };
-        let chunk_size = total_size / total_chunk;
         Ok(Self {
             handle: None,
+            client,
             url: url.to_owned(),
             output: output.to_owned(),
-            chunk_size,
             total_chunk,
-            tracer: Tracer::new(total_size),
+            counter: Arc::new(AtomicU64::new(0)),
+            total_size,
         })
     }
 
-    pub fn start(&mut self) -> &Tracer {
+    pub fn start(&mut self) {
         self.handle.replace(tokio::spawn(download(
+            self.client.clone(),
             self.url.clone(),
             self.output.clone(),
-            self.chunk_size,
             self.total_chunk,
-            self.tracer.clone(),
+            self.counter.clone(),
+            self.total_size,
         )));
-        &self.tracer
+    }
+
+    pub fn progress(&self) -> u64 {
+        self.counter.load(Ordering::Relaxed) * 100 / self.total_size
+    }
+
+    pub fn running(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
+    pub fn cancel(&mut self) {
+        self.handle.take();
     }
 
     pub async fn join(&mut self) -> Result<(), DownloadError> {
@@ -128,41 +110,37 @@ impl Downloader {
 }
 
 async fn download(
+    client: Client,
     url: String,
     output: String,
-    chunk_size: u64,
     total_chunk: u64,
-    tracer: Tracer,
+    counter: Arc<AtomicU64>,
+    total_size: u64,
 ) -> Result<(), DownloadError> {
-    let total_size = tracer.total_size;
-
     File::create(&output).await?.set_len(total_size).await?;
 
     let producers = iter((0..total_chunk).map(|i| {
+        let client = client.clone();
         let url = &url;
         let output = &output;
-        let tracer = &tracer;
+        let counter = &counter;
         async move {
-            let start = i * chunk_size;
+            let start = i * MB;
             let end = (i == total_chunk - 1)
                 .then_some(total_size)
-                .unwrap_or((i + 1) * chunk_size - 1);
-            let response = Client::new()
+                .unwrap_or((i + 1) * MB - 1);
+            let response = client
                 .get(url)
-                .header(AGENT.0, AGENT.1)
                 .header("Range", format!("bytes={}-{}", start, end))
                 .send()
                 .await?;
             if response.status().is_success() {
-                let mut file = BufWriter::new({
-                    let mut file = OpenOptions::new().write(true).open(output).await?;
-                    file.seek(std::io::SeekFrom::Start(start)).await?;
-                    file
-                });
+                let mut file = BufWriter::new(OpenOptions::new().write(true).open(output).await?);
+                file.seek(std::io::SeekFrom::Start(start)).await?;
                 let mut stream = response.bytes_stream();
                 while let Some(chunk) = stream.next().await {
                     let chunk = chunk?;
-                    tracer.update(&chunk);
+                    counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                     file.write_all(&chunk).await?;
                 }
                 file.flush().await?;
@@ -172,7 +150,7 @@ async fn download(
             }
         }
     }))
-    .buffer_unordered(12);
+    .buffer_unordered(32);
 
     let error: String = producers
         .collect::<Vec<_>>()
