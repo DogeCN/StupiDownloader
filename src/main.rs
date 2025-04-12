@@ -10,6 +10,7 @@ fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_inner_size([400.0, 300.0])
+            .with_resizable(false)
             .with_always_on_top(),
         ..Default::default()
     };
@@ -21,13 +22,15 @@ fn main() -> Result<(), eframe::Error> {
 }
 
 struct App {
+    _runtime: Runtime,
     tracer: Receiver<u64>,
 }
 
 impl Default for App {
     fn default() -> Self {
+        let runtime = Runtime::new().unwrap();
         Self {
-            tracer: Runtime::new().unwrap().block_on(async {
+            tracer: runtime.block_on(async {
                 let mut downloader =
                     Downloader::new(&Clipboard::new().unwrap().get_text().unwrap())
                         .await
@@ -35,6 +38,7 @@ impl Default for App {
                 downloader.start();
                 downloader.watcher()
             }),
+            _runtime: runtime,
         }
     }
 }
