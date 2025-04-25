@@ -21,9 +21,9 @@ version = "1.44.2"
 features = ["rt-multi-thread"]
 
 [profile.release]
-lto = "fat"
+lto = true
 debug = 0
 panic = "abort"
-opt-level = "s"
+opt-level = 3
 codegen-units = 1
 strip = true

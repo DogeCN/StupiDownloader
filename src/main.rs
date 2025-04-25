@@ -36,6 +36,7 @@ impl Default for StupidApp {
     fn default() -> Self {
         let runtime = Builder::new_multi_thread()
             .worker_threads(16)
+            .global_queue_interval(11)
             .enable_all()
             .build()
             .unwrap();
